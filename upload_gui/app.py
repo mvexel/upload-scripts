@@ -9,7 +9,8 @@ import webbrowser
 import platform
 
 TITLE = "OpenStreetCam Upload"
-INSTRUCTIONS = "This lets you upload a directory of photos to OpenStreetCam. This can be a directory copied from the OSC app on your phone, or a directory of photos with EXIF location data from for example an action camera."
+INSTRUCTIONS = """With this application, you can upload a directory of photos to OpenStreetCam.
+This can be a directory copied from the OSC app on your phone, or a directory of photos with EXIF location data from for example an action camera."""
 
 upload_dir = None
 authorize_url = None
@@ -43,7 +44,7 @@ def hasToken():
     return os.path.isfile('access_token.txt')
 
 
-def getToken(val):
+def getRequestTokens(val):
     # determine input read method
     global authorize_url
     global osm
@@ -67,7 +68,11 @@ def getToken(val):
     webbrowser.open(authorize_url)
 
 
-def storeToken(val):
+def GetAccessToken(val):
+
+    if not request_token and request_token_secret:
+        app.infoBox("Get Tokens First", "Please Get Request Tokens before getting Access Tokens.")
+
     cj = cookiejar.CookieJar()
     cookies = [{
         "name": "",
@@ -101,13 +106,15 @@ def storeToken(val):
         opener.open(urllib.request.Request(authorize_url))
     except urllib.error.HTTPError as e:
         app.infoBox("Can't get osm id", "Please retry and report this issue with the error code on https://github.com/openstreetcam/uploader. Error: {}".format(e))
+    
     pin = cj._cookies['www.openstreetmap.org']['/']['_osm_session'].value
 
     try:
-        request_token_access, request_token_secret_access = osm.get_access_token(request_token,
-                                                                                 request_token_secret,
-                                                                                 method='POST',
-                                                                                 data={'oauth_verifier': pin})
+        request_token_access, request_token_secret_access = \
+            osm.get_access_token(request_token,
+                                 request_token_secret,
+                                 method='POST',
+                                 data={'oauth_verifier': pin})
         data_access = {'request_token': request_token_access,
                        'secret_token': request_token_secret_access
                        }
@@ -128,19 +135,23 @@ app.addLabel("title", TITLE)
 
 app.addMessage("instructions", INSTRUCTIONS)
 
-app.startLabelFrame("0. Get OSM Token")
+app.startLabelFrame("0. Grant Access")
 if not hasToken():
-    app.addButton("Get Token", getToken)
-    app.addMessage("oauthMessage", "This will open a browser window where you can log in to OSM and grant this application access to read your basic OSM account information. Once you have done this click 'Store Token' below.")
-    app.addButton("Store Token", storeToken)
+    app.addMessage("oauthMessageStep1", """This application needs read access to your basic OSM account information. 
+This is done through a mechanism called OAuth. This way we don't need your OSM username and password. 
+There are two steps. The first step is retrieving access tokens. This involves opening a browser window that lets you log in to OSM and grant access to your basic account information.""")
+    app.addButton("Get Request Token", getRequestTokens)
+    app.addMessage("oauthMessageStep2", """The second step involves getting an access token using the request tokens we received in step 1. This token is stored in a file 'access_token.txt'. Don't share this file!""")
+    app.addButton("Get Access Tokens", GetAccessToken)
 else:
-    app.addMessage("oauthMessage", "We have a token, good to go")
+    app.addMessage("oauthMessage", """We have a token, good to go""")
 app.stopLabelFrame()
 
 app.startLabelFrame("1. Select Upload Type")
 app.addRadioButton("uploadtype", uploadTypes["exif"])
 # app.addRadioButton("uploadtype", uploadTypes["app"])  # (not supported for now)
-app.addMessage("unsuported", "Only EXIF uploads supported for now, please use the Python script to upload photos from mobile app directory")
+app.addMessage("unsuported", """Only EXIF uploads supported for now.
+Please use the Python script to upload photos from mobile app directory""")
 app.stopLabelFrame()
 
 
