@@ -8,7 +8,8 @@ import requests
 import webbrowser
 import exifread
 from operator import itemgetter
-
+import threading
+import time
 
 TITLE = "OpenStreetCam Upload"
 INSTRUCTIONS = """With this application, you can upload a directory of photos to OpenStreetCam.
@@ -19,11 +20,19 @@ authorize_url = None
 osm = None
 request_token = None
 request_token_secret = None
+access_token = None
 
-url_sequence = 'http://openstreetcam.com/1.0/sequence/'
-url_photo = 'http://openstreetcam.com/1.0/photo/'
-url_finish = 'http://openstreetcam.com/1.0/sequence/finished-uploading/'
-url_access = 'http://openstreetcam.com/auth/openstreetmap/client_auth'
+
+# test endpoints
+url_sequence = 'http://testing.openstreetview.com/1.0/sequence/'
+url_photo = 'http://testing.openstreetview.com/1.0/photo/'
+url_finish = 'http://testing.openstreetview.com/1.0/sequence/finished-uploading/'
+url_access = 'http://testing.openstreetview.com/auth/openstreetmap/client_auth'
+
+# url_sequence = 'http://openstreetcam.com/1.0/sequence/'
+# url_photo = 'http://openstreetcam.com/1.0/photo/'
+# url_finish = 'http://openstreetcam.com/1.0/sequence/finished-uploading/'
+# url_access = 'http://openstreetcam.com/auth/openstreetmap/client_auth'
 
 uploadTypes = {
     "app": "Directory copied from OSC app",
@@ -34,8 +43,8 @@ uploadTypes = {
 def pickDirectory(val):
     global upload_dir
     upload_dir = app.directoryBox("Directory", os.path.expanduser("~"))
-    app.setMessage("dirname", upload_dir)
-    scanSourceFolder()
+    threading.Thread(target=scanSourceFolder).start()
+    app.setMessage("dirname", "scanning {}...".format(upload_dir))
 
 
 def doUpload(val):
@@ -45,6 +54,13 @@ def doUpload(val):
 
 def hasToken():
     return os.path.isfile('access_token.txt')
+
+
+def load_access_token():
+    global access_token
+    token_file = open("access_token.txt", "r+")
+    string = token_file.read()
+    access_token = string
 
 
 def getRequestTokens(val):
@@ -74,7 +90,7 @@ def getRequestTokens(val):
 
 
 def GetAccessToken(val):
-
+    global access_token
     if not request_token and request_token_secret:
         app.infoBox("Get Tokens First", "Please Get Request Tokens before getting Access Tokens.")
 
@@ -153,6 +169,8 @@ def scanSourceFolder():
     time_stamp_list = []
     exist_timestamp = True
     photos_found = False
+    latitude = None
+    longitude = None
     for photo_path in [p for p in photos_path]:
         if ('jpg' in photo_path.lower() or 'jpeg' in photo_path.lower()) and "thumb" not in photo_path.lower():
             photos_found = True
@@ -178,10 +196,10 @@ def scanSourceFolder():
                 try:
                     tags = exifread.process_file(open(path + photo_path, 'rb'))
                     latitude, longitude = get_exif_location(tags)
-                    if latitude is None and longitude is None:
-                        latitude, longitude, compas = get_data_from_json(path, photo_path)
+                    # if latitude is None and longitude is None:
+                    #     latitude, longitude, compas = get_data_from_json(path, photo_path)
                 except Exception as ex:
-                    print (ex)
+                    app.setMessage("dirname", ex)
                     continue
             data_sequence = {'uploadSource': 'Python',
                              'access_token': access_token,
@@ -202,11 +220,8 @@ def scanSourceFolder():
             try:
                 id_sequence = h.json()['osv']['sequence']['id']
             except Exception as ex:
-                print("Fail code:" + str(ex))
-                print("Fail to create the sequence")
+                app.setMessage("dirname", """Failed to create the sequence, code: {}. Please try again.""".format(str(ex)))
                 os.remove(path + "sequence_file.txt")
-                print("Please restart the script")
-                sys.exit()
             sequence_file.write(id_sequence)
             sequence_file.close()
     try:
@@ -236,12 +251,70 @@ def scanSourceFolder():
     global START_TIME
     START_TIME = time.time()
 
+    # after finishing, update UI.
+    app.setMessage("dirname", "{} photos found to upload.".format(nr_photos_upload))
+
+
+def get_data_from_json(path, photo_name):
+    folder_name = os.path.basename(path[:-1])
+    json_path = path.replace(folder_name,'cameras/internal')
+    json_file = json_path + photo_name.replace('jpg','json')
+    with open(json_file) as data_file:
+        json_data = json.load(data_file)
+    # for row in json_data:
+    #     print(row)
+    try:
+        lat = json_data['MAPLatitude']
+        lon = json_data['MAPLongitude']
+        comapss = json_data['MAPCompassHeading']['TrueHeading']
+    except:
+        lat = None
+        lon = None
+        comapss = 1
+    return lat, lon, comapss
+
+
+def _get_if_exist(data, key):
+    if key in data:
+        return data[key]
+
+    return None
+
+
+def _convert_to_degress(value):
+    d = float(value.values[0].num) / float(value.values[0].den)
+    m = float(value.values[1].num) / float(value.values[1].den)
+    s = float(value.values[2].num) / float(value.values[2].den)
+
+    return d + (m / 60.0) + (s / 3600.0)
+
 
 def get_exif(path):
     with open(path, 'rb') as fh:
         tags = exifread.process_file(fh, stop_tag="EXIF DateTimeOriginal")
         dateTaken = tags["EXIF DateTimeOriginal"]
         return dateTaken
+
+
+def get_exif_location(exif_data):
+    lat = None
+    lon = None
+
+    gps_latitude = _get_if_exist(exif_data, 'GPS GPSLatitude')
+    gps_latitude_ref = _get_if_exist(exif_data, 'GPS GPSLatitudeRef')
+    gps_longitude = _get_if_exist(exif_data, 'GPS GPSLongitude')
+    gps_longitude_ref = _get_if_exist(exif_data, 'GPS GPSLongitudeRef')
+
+    if gps_latitude and gps_latitude_ref and gps_longitude and gps_longitude_ref:
+        lat = _convert_to_degress(gps_latitude)
+        if gps_latitude_ref.values[0] != 'N':
+            lat = 0 - lat
+
+        lon = _convert_to_degress(gps_longitude)
+        if gps_longitude_ref.values[0] != 'E':
+            lon = 0 - lon
+
+    return lat, lon
 
 
 # Build the UI
@@ -263,6 +336,7 @@ There are two steps. The first step is retrieving access tokens. This involves o
     app.addMessage("okOAuthStep2", "")
     app.setMessageFg("okOAuthStep2", "#339933")
 else:
+    load_access_token()
     app.addMessage("oauthMessage", "OK")
     app.setMessageFg("oauthMessage", "#339933")
 app.stopLabelFrame()
