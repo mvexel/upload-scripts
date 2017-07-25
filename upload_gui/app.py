@@ -10,24 +10,39 @@ import exifread
 from operator import itemgetter
 import threading
 import time
+from concurrent import futures
 
 TITLE = "OpenStreetCam Upload"
 INSTRUCTIONS = """With this application, you can upload a directory of photos to OpenStreetCam.
 This can be a directory copied from the OSC app on your phone, or a directory of photos with EXIF location data from for example an action camera."""
+max_workers = 4  # upload threads
 
-upload_dir = None
+path = None
 authorize_url = None
 osm = None
 request_token = None
 request_token_secret = None
 access_token = None
-
+COUNT_TO_WRITE = None
+START_TIME = None
+photos_path = None
+count_list = None
+nr_photos_upload = None
+id_sequence = None
+count = 0
 
 # test endpoints
-url_sequence = 'http://testing.openstreetview.com/1.0/sequence/'
-url_photo = 'http://testing.openstreetview.com/1.0/photo/'
-url_finish = 'http://testing.openstreetview.com/1.0/sequence/finished-uploading/'
-url_access = 'http://testing.openstreetview.com/auth/openstreetmap/client_auth'
+# url_sequence = 'http://testing.openstreetview.com/1.0/sequence/'
+# url_photo = 'http://testing.openstreetview.com/1.0/photo/'
+# url_finish = 'http://testing.openstreetview.com/1.0/sequence/finished-uploading/'
+# url_access = 'http://testing.openstreetview.com/auth/openstreetmap/client_auth'
+
+# staging endpoints
+url_sequence = 'http://staging.openstreetview.com/1.0/sequence/'
+url_photo = 'http://staging.openstreetview.com/1.0/photo/'
+url_finish = 'http://staging.openstreetview.com/1.0/sequence/finished-uploading/'
+url_access = 'http://staging.openstreetview.com/auth/openstreetmap/client_auth'
+
 
 # url_sequence = 'http://openstreetcam.com/1.0/sequence/'
 # url_photo = 'http://openstreetcam.com/1.0/photo/'
@@ -41,16 +56,16 @@ uploadTypes = {
 
 
 def pickDirectory(val):
-    global upload_dir
-    upload_dir = app.directoryBox("Directory", os.path.expanduser("~"))
+    global path
+    path = app.directoryBox("Directory", os.path.expanduser("~"))
     threading.Thread(target=scanSourceFolder).start()
-    app.setMessage("dirname", "scanning {}...".format(upload_dir))
+    app.setMessage("dirname", "scanning {}...".format(path))
 
 
 def doUpload(val):
-    if not upload_dir:
+    if not path:
         app.infoBox("No Directory Selected", "You didn't select a directory to upload yet")
-
+    upload()
 
 def hasToken():
     return os.path.isfile('access_token.txt')
@@ -153,8 +168,12 @@ def GetAccessToken(val):
 
 
 def scanSourceFolder():
-    global upload_dir
-    path = upload_dir
+    global path
+    global photos_path
+    global count_list
+    global nr_photos_upload
+    global id_sequence
+    global count
 
     local_dirs = os.listdir()
     if str(path).replace('/', '') in local_dirs:
@@ -196,8 +215,6 @@ def scanSourceFolder():
                 try:
                     tags = exifread.process_file(open(path + photo_path, 'rb'))
                     latitude, longitude = get_exif_location(tags)
-                    # if latitude is None and longitude is None:
-                    #     latitude, longitude, compas = get_data_from_json(path, photo_path)
                 except Exception as ex:
                     app.setMessage("dirname", ex)
                     continue
@@ -242,36 +259,142 @@ def scanSourceFolder():
         if ('jpg' in photo_path.lower() or 'jpeg' in photo_path.lower()) and "thumb" not in photo_path.lower():
             nr_photos_upload += 1
     print("Found " + str(nr_photos_upload) + " pictures to upload")
+
+    # after finishing, update UI.
+    app.setMessage(
+        "dirname", "{} photos found to upload.".format(
+            nr_photos_upload))
+
+
+def upload_photos(url_photo, dict, timeout, path):
+    photo = dict['photo']
+    data_photo = dict['data']
+    name = dict['name']
+    conn = requests.post(url_photo, data=data_photo, files=photo, timeout=timeout)
+    if int(conn.status_code) != 200:
+        print("Request/Response fail")
+        retry_count = 0
+        while int(conn.status_code) != 200:
+            print("Retry attempt : " + str(retry_count))
+            conn = requests.post(url_photo, data=data_photo, files=photo, timeout=timeout)
+            retry_count += 1
+    photo['photo'][1].close()
+    with open(path + "count_file.txt", "a+") as fis:
+        global COUNT_TO_WRITE
+        COUNT_TO_WRITE += 1
+        fis.write((str(COUNT_TO_WRITE)) + '\n')
+        fis.close()
+    return {'json': conn.json(), 'name': name}
+
+
+def thread(max_workers, url_photo, list_to_upload, path, count_uploaded, total_img):
+    with futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(upload_photos, url_photo, dict, 1000, path): dict for dict in list_to_upload}
+        for future in futures.as_completed(future_to_url):
+            try:
+                data = future.result()['json']
+                name = future.result()['name']
+                
+                if max_workers >=  float(COUNT_TO_WRITE):
+                        estimated_time = '...'
+                else:
+                        elapsed_time = time.time() - START_TIME
+                        estimated_time = str(timedelta(seconds=(elapsed_time/(COUNT_TO_WRITE))*(total_img-COUNT_TO_WRITE))).split(".")[0]
+                        
+   
+                print("processing {}".format(name))
+                if data['status']['apiCode'] == "600":
+                    percentage = float((float(COUNT_TO_WRITE) * 100) / float(total_img))
+                    print(("Uploaded - " + str(COUNT_TO_WRITE) + ' of total :' + str(
+                        total_img) + ", percentage: " + str(round(percentage, 2)) + "%"+" ET:"+estimated_time))
+                elif data['status']['apiCode'] == "610":
+                    print("skipping - a requirement arguments is missing for upload")
+                elif data['status']['apiCode'] == "611":
+                    print("skipping - image does not have GPS location metadata")
+                elif data['status']['apiCode'] == "660":
+                    print("skipping - duplicate image")
+                else:
+                    print (data['status'])
+                    print("skipping - bad image")
+            except Exception as exc:
+                print (exc)
+                print ("Uploaded error")
+    return count_uploaded
+
+
+def upload():
+    global count
     local_count = 0
     list_to_upload = []
     int_start = 0
-    count_uploaded = count
+    count_uploaded = 0
     global COUNT_TO_WRITE
-    COUNT_TO_WRITE = count
+    COUNT_TO_WRITE = 0
     global START_TIME
     START_TIME = time.time()
 
-    # after finishing, update UI.
-    app.setMessage("dirname", "{} photos found to upload.".format(nr_photos_upload))
+    for index in range(int_start, len([p for p in photos_path])):
+        photo_to_upload = photos_path[index]
+        local_count += 1
+        if ('jpg' in photo_to_upload.lower() or 'jpeg' in photo_to_upload.lower()) and \
+                        "thumb" not in photo_to_upload.lower() and local_count not in count_list:
+            total_img = nr_photos_upload
+            photo_name = os.path.basename(photo_to_upload)
+            try:
+                photo = {'photo': (photo_name, open(path + photo_to_upload, 'rb'), 'image/jpeg')}
+                try:
+                    latitude, longitude, compas = get_gps_lat_long_compass(path + photo_to_upload)
+                except Exception:
+                    try:
+                        tags = exifread.process_file(open(path + photo_to_upload, 'rb'))
+                        latitude, longitude = get_exif_location(tags)
+                        compas = -1
+                        # if latitude is None and longitude is None:
+                        #     latitude, longitude, compas = get_data_from_json(path, photo_path)
+                    except Exception:
+                        continue
+                if compas == -1:
+                    # TODO: add 'acces_token': acces_token,
+                    data_photo = {'access_token': access_token,
+                                  'coordinate': str(latitude) + "," + str(longitude),
+                                  'sequenceId': id_sequence,
+                                  'sequenceIndex': count
+                                  }
+                else:
+                    data_photo = {'access_token': access_token,
+                                  'coordinate': str(latitude) + "," + str(longitude),
+                                  'sequenceId': id_sequence,
+                                  'sequenceIndex': count,
+                                  'headers': compas
+                                  }
+                info_to_upload = {'data': data_photo, 'photo': photo, 'name': photo_to_upload}
+                list_to_upload.append(info_to_upload)
+                if count != local_count:
+                    count += 1
+            except Exception as ex:
+                print(ex)
+        if (index % 100 == 0 and index != 0) and local_count not in count_list:
+            count_uploaded = thread(
+                max_workers,
+                url_photo,
+                list_to_upload,
+                path,
+                count_uploaded,
+                total_img)
+            list_to_upload = []
+    if (index % 100 != 0) or index == 0:
+        count_uploaded = thread(max_workers, url_photo, list_to_upload, path, count_uploaded, nr_photos_upload)
 
-
-def get_data_from_json(path, photo_name):
-    folder_name = os.path.basename(path[:-1])
-    json_path = path.replace(folder_name,'cameras/internal')
-    json_file = json_path + photo_name.replace('jpg','json')
-    with open(json_file) as data_file:
-        json_data = json.load(data_file)
-    # for row in json_data:
-    #     print(row)
-    try:
-        lat = json_data['MAPLatitude']
-        lon = json_data['MAPLongitude']
-        comapss = json_data['MAPCompassHeading']['TrueHeading']
-    except:
-        lat = None
-        lon = None
-        comapss = 1
-    return lat, lon, comapss
+    data_finish = {'access_token': access_token,
+                   'sequenceId': id_sequence
+                   }
+    f = requests.post(url_finish, data=data_finish)
+    if f.json()['status']['apiCode'] == '600':
+        print(("Finish uploading from dir: " + path + " with sequence id: " + str(id_sequence)))
+    else:
+        print(("FAIL uploading from dir: " + path))
+        print("Error: ")
+        print(f.json())
 
 
 def _get_if_exist(data, key):
@@ -353,7 +476,7 @@ app.startLabelFrame("2. Select Directory")
 app.addButton("Select Directory", pickDirectory)
 app.stopLabelFrame()
 
-app.addMessage("dirname", upload_dir)
+app.addMessage("dirname", path)
 
 app.startLabelFrame("3. Upload")
 app.addButton("Upload", doUpload)
